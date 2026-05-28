@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdrl-gravity"
+version = "0.1.0"
+description = "Semi-Supervised Dual Regression Learning for Marine Gravity Super-Resolution"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "pytorch-msssim>=1.0.0",
+    "netCDF4>=1.6.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "scikit-image>=0.21.0",
+    "tqdm>=4.65.0",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+sdrl-preprocess = "scripts.preprocess:main"
+sdrl-train      = "scripts.train:main"
+sdrl-evaluate   = "scripts.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sdrl*", "scripts*"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-v --tb=short"

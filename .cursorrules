@@ -1,0 +1,53 @@
+# Cursor Rules — SDRL Gravity Super-Resolution
+
+## Project
+Implementation of "Super-Resolution Reconstruction of Gravity Data Using
+Semi-Supervised Dual Regression Learning" (Remote Sens. 2026, 18, 453).
+
+## Stack
+- Python 3.10+, PyTorch 2.1+
+- Core library in `sdrl/`
+- CLI entry points in `scripts/`
+- Config files in `configs/` (YAML)
+
+## Architecture (sdrl/model.py)
+- **PrimaryNet**: LR→HR ×4, encoder-decoder with LiteMLA attention + RCAB blocks
+  - Input: (B, 1, 50, 50)  Output: (B, 1, 200, 200)
+  - Skip connections use F.interpolate for spatial alignment (not PixelShuffle)
+- **DualNet**: HR→LR degradation, Input: (B, 1, 200, 200)  Output: (B, 1, 50, 50)
+- Channel sizes: stem=32, enc1=64, enc2=128, enc3=256, bottleneck=256
+
+## Loss (sdrl/loss.py)
+- CompositeLoss: (1-α)·L1 + α·(1-SSIM), α is learnable, init=0.9
+- SDRLLoss: Eq. 5 from paper — cycle + supervised + dual_reg + dual_cons terms
+- Paired samples use all 4 terms; unpaired samples use only cycle term
+
+## Data (sdrl/preprocess.py)
+- Satellite: SSV33.1 NetCDF, 1′ resolution, global
+- Shipborne: multiple .grd files (GMT format), ~15″ resolution
+- Patches: LR=50×50, HR=200×200, stride=25 (50% overlap)
+- QC: keep SSIM ∈ [0.2, 0.9] and RMSE < 0.4
+- Memory-safe: process one .grd file at a time, never build global grid
+
+## Conventions
+- All patches normalised to [0, 1] before storing
+- Saved as .npy: shape (N, 1, H, W)
+- Configs loaded from YAML via `configs/` directory
+- Checkpoints saved to `outputs/checkpoints/`
+- Logs saved to `outputs/logs/`
+
+## When modifying model.py
+- ALWAYS check skip connection channel counts match decoder in_ch + skip_ch
+- ALWAYS use F.interpolate(size=skip.shape[-2:]) not PixelShuffle for skip alignment
+- Run tests/test_model.py after any architecture change
+
+## When modifying loss.py
+- Paired forward: pass both x and y to SDRLLoss.forward()
+- Unpaired forward: pass y=None — only cycle loss is computed
+- alpha is stored as logit internally, access via .alpha property
+
+## Code style
+- Type hints on all public functions
+- Docstrings: one-line summary + Args/Returns for complex functions
+- No bare except clauses
+- Use pathlib.Path for file operations in scripts/

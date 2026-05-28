@@ -1,0 +1,37 @@
+# configs/sdrl.yaml
+# Semi-supervised SDRL training configuration
+
+data:
+  sat_path:   "data/raw/grav_33.1.nc"
+  ship_path:  "data/raw/shipborne"        # folder with all .grd files
+  paired_dir: "data/processed/paired"
+  unpair_dir: "data/processed/unpaired"
+  patch_lr:   50
+  patch_hr:   200
+  scale:      4
+  stride_lr:  25
+  ssim_lo:    0.2
+  ssim_hi:    0.9
+  rmse_max:   0.4
+
+model:
+  base_ch: 32                             # network width multiplier
+
+train:
+  mode:        "sdrl"                     # "sdrl" | "supervised"
+  epochs:      500
+  batch_size:  8                          # 4 paired + 4 unpaired per step
+  lr_P:        1.0e-4                     # PrimaryNet learning rate
+  lr_D:        1.0e-4                     # DualNet learning rate
+  lr_alpha:    1.0e-3                     # learnable α learning rate
+  lam:         1.0                        # cycle-consistency weight λ
+  mu:          0.5                        # dual regression weight µ
+  sigma:       0.5                        # dual consistency weight σ
+  val_split:   0.1
+  num_workers: 4
+  seed:        42
+
+output:
+  checkpoint_dir: "outputs/checkpoints"
+  log_dir:        "outputs/logs"
+  save_every:     10                      # save checkpoint every N epochs

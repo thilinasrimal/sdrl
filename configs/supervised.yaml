@@ -1,0 +1,33 @@
+# configs/supervised.yaml
+# Supervised-only baseline (no cycle consistency, no unpaired data)
+
+data:
+  sat_path:   "data/raw/grav_33.1.nc"
+  ship_path:  "data/raw/shipborne"
+  paired_dir: "data/processed/paired"
+  unpair_dir: "data/processed/unpaired"
+  patch_lr:   50
+  patch_hr:   200
+  scale:      4
+  stride_lr:  25
+  ssim_lo:    0.2
+  ssim_hi:    0.9
+  rmse_max:   0.4
+
+model:
+  base_ch: 32
+
+train:
+  mode:        "supervised"               # only PrimaryNet trained
+  epochs:      500
+  batch_size:  8
+  lr_P:        1.0e-4
+  lr_alpha:    1.0e-3
+  val_split:   0.1
+  num_workers: 4
+  seed:        42
+
+output:
+  checkpoint_dir: "outputs/checkpoints"
+  log_dir:        "outputs/logs"
+  save_every:     10
