@@ -241,47 +241,71 @@ def _extract_from_one_file(ship_path, lon_sat, lat_sat, grav_sat,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Incremental .npy writer — appends to growing arrays without full reload
+# Atomic accumulator — saves LR+HR as ONE .npz file to prevent desync
 # ══════════════════════════════════════════════════════════════════════════
 class _NpyAccumulator:
-    """Accumulates patches in memory and flushes to disk in batches."""
-    def __init__(self, flush_every=2000):
-        self.flush_every = flush_every
-        self.paired_lr  = []
-        self.paired_hr  = []
-        self.unpaired_lr = []
-        self._n_paired   = 0
-        self._n_unpaired = 0
+    """
+    KEY FIX: LR and HR patches saved atomically as paired.npz
+    so they can NEVER get out of sync due to crashes or partial runs.
+    np.savez writes one file containing both arrays.
+    """
+    def __init__(self, flush_every=500):
+        self.flush_every  = flush_every
+        self.paired_lr    = []
+        self.paired_hr    = []
+        self.unpaired_lr  = []
+        self._n_paired    = 0
+        self._n_unpaired  = 0
 
     def add(self, p_lr, p_hr, u_lr):
+        assert len(p_lr) == len(p_hr), \
+            f"LR/HR count mismatch: {len(p_lr)} vs {len(p_hr)}"
         self.paired_lr.extend(p_lr)
         self.paired_hr.extend(p_hr)
         self.unpaired_lr.extend(u_lr)
         if len(self.paired_lr) >= self.flush_every or \
-           len(self.unpaired_lr) >= self.flush_every:
+           len(self.unpaired_lr) >= self.flush_every * 2:
             self.flush()
 
     def flush(self):
         os.makedirs(PAIRED_DIR, exist_ok=True)
         os.makedirs(UNPAIR_DIR, exist_ok=True)
+
         if self.paired_lr:
-            self._append_npy(f'{PAIRED_DIR}/lr_patches.npy',
-                             np.stack(self.paired_lr)[:, np.newaxis])
-            self._append_npy(f'{PAIRED_DIR}/hr_patches.npy',
-                             np.stack(self.paired_hr)[:, np.newaxis])
-            self._n_paired  += len(self.paired_lr)
-            self.paired_lr   = []
-            self.paired_hr   = []
+            assert len(self.paired_lr) == len(self.paired_hr)
+            lr_arr = np.stack(self.paired_lr)[:, np.newaxis]
+            hr_arr = np.stack(self.paired_hr)[:, np.newaxis]
+            self._append_npz(f'{PAIRED_DIR}/paired.npz', lr_arr, hr_arr)
+            self._n_paired += len(self.paired_lr)
+            self.paired_lr  = []
+            self.paired_hr  = []
+
         if self.unpaired_lr:
-            self._append_npy(f'{UNPAIR_DIR}/lr_patches.npy',
-                             np.stack(self.unpaired_lr)[:, np.newaxis])
+            u_arr = np.stack(self.unpaired_lr)[:, np.newaxis]
+            self._append_npy(f'{UNPAIR_DIR}/lr_patches.npy', u_arr)
             self._n_unpaired += len(self.unpaired_lr)
             self.unpaired_lr  = []
+
         gc.collect()
 
     @staticmethod
+    def _append_npz(path, new_lr, new_hr):
+        """Write LR+HR atomically — one file, always in sync."""
+        if os.path.exists(path):
+            existing = np.load(path)
+            lr = np.concatenate([existing['lr'], new_lr], axis=0)
+            hr = np.concatenate([existing['hr'], new_hr], axis=0)
+            del existing
+        else:
+            lr, hr = new_lr, new_hr
+        # tmp must be in same dir as target for atomic rename
+        tmp = os.path.join(os.path.dirname(path), '_paired_tmp.npz')
+        np.savez_compressed(tmp, lr=lr, hr=hr)
+        os.replace(tmp, path)
+        del lr, hr
+
+    @staticmethod
     def _append_npy(path, new_arr):
-        """Concatenate new_arr onto an existing .npy (or create it)."""
         if os.path.exists(path):
             existing = np.load(path)
             combined = np.concatenate([existing, new_arr], axis=0)
@@ -292,10 +316,8 @@ class _NpyAccumulator:
         del combined
 
     def totals(self):
-        return self._n_paired + len(self.paired_lr), \
-               self._n_unpaired + len(self.unpaired_lr)
-
-
+        return (self._n_paired   + len(self.paired_lr),
+                self._n_unpaired + len(self.unpaired_lr))
 # ══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ══════════════════════════════════════════════════════════════════════════

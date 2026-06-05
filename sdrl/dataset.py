@@ -17,23 +17,35 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 # ════════════════════════════════════════════════════════════════════════════
 class PairedGravityDataset(Dataset):
     """
-    Loads lr_patches.npy and hr_patches.npy from a directory.
-    Each sample returns (lr_tensor, hr_tensor) both in [0, 1].
+    Loads paired.npz (atomic LR+HR) or legacy lr/hr_patches.npy.
     Shapes: lr (1,50,50), hr (1,200,200).
     """
     def __init__(self, data_dir: str, augment: bool = True):
         self.augment = augment
-        lr_path = os.path.join(data_dir, 'lr_patches.npy')
-        hr_path = os.path.join(data_dir, 'hr_patches.npy')
+        npz_path = os.path.join(data_dir, 'paired.npz')
+        lr_path  = os.path.join(data_dir, 'lr_patches.npy')
+        hr_path  = os.path.join(data_dir, 'hr_patches.npy')
 
-        if not os.path.exists(lr_path):
-            raise FileNotFoundError(f"LR patches not found: {lr_path}\n"
-                                    "Run preprocess.run_preprocessing() first.")
+        if os.path.exists(npz_path):
+            # New atomic format — LR and HR always in sync
+            data     = np.load(npz_path)
+            self.lr  = data['lr']   # (N, 1, 50, 50)
+            self.hr  = data['hr']   # (N, 1, 200, 200)
+            print(f"PairedDataset: {len(self.lr):,} samples from paired.npz")
+        elif os.path.exists(lr_path) and os.path.exists(hr_path):
+            # Legacy format — check alignment
+            self.lr = np.load(lr_path, mmap_mode='r')
+            self.hr = np.load(hr_path, mmap_mode='r')
+            print(f"PairedDataset: {len(self.lr):,} samples (legacy .npy format)")
+            print("WARNING: legacy format may have LR/HR sync issues. "
+                  "Rerun preprocessing to get paired.npz")
+        else:
+            raise FileNotFoundError(
+                f"No patch data found in {data_dir}\n"
+                "Run preprocess.run_preprocessing() first.")
 
-        self.lr = np.load(lr_path, mmap_mode='r')  # (N, 1, 50, 50)
-        self.hr = np.load(hr_path, mmap_mode='r')  # (N, 1, 200, 200)
-        assert len(self.lr) == len(self.hr), "LR/HR length mismatch"
-        print(f"PairedDataset: {len(self.lr):,} samples from {data_dir}")
+        assert len(self.lr) == len(self.hr), \
+            f"LR/HR length mismatch: {len(self.lr)} vs {len(self.hr)}"
 
     def __len__(self):
         return len(self.lr)
