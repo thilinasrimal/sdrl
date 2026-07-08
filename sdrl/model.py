@@ -1,10 +1,23 @@
 """
-model.py  (v2 — fixed blank output + stronger decoder)
+model.py  (v3 — multi-channel input support)
 -------------------------------------------------------
 SDRL network architecture for gravity super-resolution.
 Based on: Remote Sens. 2026, 18, 453  (Section 3.4)
 
-Fixes vs v1:
+Fixes vs v2:
+  - PrimaryNet now accepts `in_channels` (default 1, backward compatible)
+  - stem's first conv uses in_channels instead of hardcoded 1
+  - shortcut path now projects in_channels -> 1 (via 1x1 conv) BEFORE
+    bilinear upsampling, since the shortcut is a residual skip of the
+    gravity signal specifically, not the auxiliary channels (GEBCO,
+    NZ Bathymetry, EGM2008). When in_channels == 1 this projection is
+    an nn.Identity(), so single-channel behavior is unchanged.
+  - build_models() now accepts and forwards in_channels
+  - DualNet is UNCHANGED and stays fixed at 1 input/output channel by
+    design: it maps HR gravity -> LR gravity for the cycle-consistency
+    term and was never meant to touch the auxiliary channels.
+
+Fixes carried over from v1->v2:
   - Shortcut scaled by learnable 0.1 weight so decoder is forced to
     actually learn rather than collapsing to pure bilinear upsampling
   - BatchNorm added to stem to normalise input distribution
@@ -165,19 +178,30 @@ class DecoderBlock(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 class PrimaryNet(nn.Module):
     """
-    Input : (B, 1, 50,  50)
+    Input : (B, in_channels, 50,  50)
     Output: (B, 1, 200, 200)
 
-    Key fix: shortcut is scaled by learnable weight init=0.1
+    `in_channels` defaults to 1 for full backward compatibility with the
+    original single-channel (gravity-only) pipeline. When in_channels > 1
+    (e.g. gravity + GEBCO + NZ Bathymetry + EGM2008), the auxiliary
+    channels are used by the encoder/bottleneck/decoder as before, but
+    the shortcut residual path is projected down to 1 channel first
+    (via `shortcut_proj`), since the shortcut is meant to be a residual
+    skip of the gravity signal specifically — the model must still learn
+    to combine the auxiliary channels through the full network, they are
+    not added directly into the output via the shortcut.
+
+    Key fix (v2): shortcut is scaled by learnable weight init=0.1
     so the decoder MUST learn meaningful residuals rather than
     collapsing to pure bilinear upsampling (blank output bug).
     """
-    def __init__(self, base_ch: int = 32):
+    def __init__(self, base_ch: int = 32, in_channels: int = 1):
         super().__init__()
         c = base_ch
+        self.in_channels = in_channels
 
         self.stem = nn.Sequential(
-            nn.Conv2d(1, c, 3, padding=1, bias=False),
+            nn.Conv2d(in_channels, c, 3, padding=1, bias=False),
             nn.BatchNorm2d(c),
             nn.LeakyReLU(0.2, inplace=True),
         )
@@ -198,7 +222,7 @@ class PrimaryNet(nn.Module):
         self.dec2 = DecoderBlock(c * 4, c * 4, c * 2, n_rcab=6)
         self.dec1 = DecoderBlock(c * 2, c * 2, c,     n_rcab=4)
 
-        # ×4 upsample with ICNR init
+        # ×4 upsample with ICNR init — always produces 1 output channel
         ps_conv = nn.Conv2d(c, 1 * 16, 3, padding=1, bias=False)
         icnr_init(ps_conv.weight, scale=4)
         self.final_up = nn.Sequential(
@@ -207,10 +231,25 @@ class PrimaryNet(nn.Module):
             nn.PixelShuffle(4),
         )
 
-        # Shortcut: scaled by small learnable weight (init=0.1)
+        # Shortcut: project multi-channel input down to 1 channel (the
+        # gravity signal) BEFORE bilinear upsampling. When in_channels==1
+        # this is a no-op (nn.Identity()), so single-channel behavior is
+        # unchanged from v2.
+        self.shortcut_proj = (
+            nn.Conv2d(in_channels, 1, kernel_size=1, bias=False)
+            if in_channels != 1 else nn.Identity()
+        )
+        if in_channels != 1:
+            # initialize as a simple average of input channels, so the
+            # starting behavior approximates "use the gravity channel"
+            # rather than random noise on the residual path
+            with torch.no_grad():
+                self.shortcut_proj.weight.fill_(1.0 / in_channels)
+
+        self.shortcut       = nn.Upsample(scale_factor=4, mode='bilinear',
+                                          align_corners=False)
+        # Shortcut scaled by small learnable weight (init=0.1)
         # This FORCES the decoder to contribute rather than being ignored
-        self.shortcut      = nn.Upsample(scale_factor=4, mode='bilinear',
-                                         align_corners=False)
         self.shortcut_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x):
@@ -224,7 +263,8 @@ class PrimaryNet(nn.Module):
         u1 = self.dec1(u2, sk1)
         hr = self.final_up(u1)
         # scaled shortcut — model must learn to produce non-trivial residuals
-        return hr + self.shortcut_scale * self.shortcut(x)
+        shortcut_1ch = self.shortcut_proj(x)
+        return hr + self.shortcut_scale * self.shortcut(shortcut_1ch)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -234,6 +274,14 @@ class DualNet(nn.Module):
     """
     Input : (B, 1, 200, 200)
     Output: (B, 1, 50,  50)
+
+    UNCHANGED from v2, and deliberately stays fixed at 1 in/out channel.
+    This network's role is the cycle-consistency term: map HR gravity
+    back down to LR gravity. It is not meant to reconstruct the
+    auxiliary channels (GEBCO, NZ Bathymetry, EGM2008) — the loss
+    function must compare its output only against the gravity channel
+    of the LR input (x[:, :1]), not the full multi-channel tensor.
+    See loss.py for the corresponding fix.
     """
     def __init__(self, base_ch: int = 32):
         super().__init__()
@@ -268,24 +316,41 @@ class DualNet(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 # Builder
 # ════════════════════════════════════════════════════════════════════════════
-def build_models(base_ch: int = 32, device: str = 'cuda'):
-    P = PrimaryNet(base_ch).to(device)
+def build_models(base_ch: int = 32, in_channels: int = 1, device: str = 'cuda'):
+    """
+    in_channels: number of input channels for PrimaryNet (e.g. 4 for
+    gravity + GEBCO + NZ Bathymetry + EGM2008). Defaults to 1 for full
+    backward compatibility. DualNet is always 1-channel by design — see
+    DualNet docstring — so it does not take an in_channels argument.
+    """
+    P = PrimaryNet(base_ch, in_channels=in_channels).to(device)
     D = DualNet(base_ch).to(device)
     n_P = sum(p.numel() for p in P.parameters() if p.requires_grad)
     n_D = sum(p.numel() for p in D.parameters() if p.requires_grad)
-    print(f"PrimaryNet : {n_P:,} params  (base_ch={base_ch})")
-    print(f"DualNet    : {n_D:,} params")
+    print(f"PrimaryNet : {n_P:,} params  (base_ch={base_ch}, in_channels={in_channels})")
+    print(f"DualNet    : {n_D:,} params  (in_channels=1, fixed)")
     return P, D
 
 
 if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    P, D = build_models(base_ch=32, device=device)
+
+    # single-channel backward-compatibility check
+    P, D = build_models(base_ch=32, in_channels=1, device=device)
     lr = torch.randn(2, 1, 50,  50, device=device)
     hr = torch.randn(2, 1, 200, 200, device=device)
     y_hat = P(lr)
     x_hat = D(y_hat)
-    print(f"P(lr)    → {y_hat.shape}  expected (2,1,200,200)")
-    print(f"D(P(lr)) → {x_hat.shape}  expected (2,1,50,50)")
+    print(f"[in_channels=1] P(lr)    → {y_hat.shape}  expected (2,1,200,200)")
+    print(f"[in_channels=1] D(P(lr)) → {x_hat.shape}  expected (2,1,50,50)")
     print(f"shortcut_scale = {P.shortcut_scale.item():.3f}")
+
+    # multi-channel check
+    P4, D4 = build_models(base_ch=32, in_channels=4, device=device)
+    lr4 = torch.randn(2, 4, 50, 50, device=device)
+    y_hat4 = P4(lr4)
+    x_hat4 = D4(y_hat4)
+    print(f"[in_channels=4] P(lr)    → {y_hat4.shape}  expected (2,1,200,200)")
+    print(f"[in_channels=4] D(P(lr)) → {x_hat4.shape}  expected (2,1,50,50)")
+
     print("✓ Model check passed")
