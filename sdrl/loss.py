@@ -1,22 +1,28 @@
 """
-loss.py  (v3 — multi-channel input support)
+loss.py  (v4 — fixed MRE metric)
 ------------------------------------------
 Loss functions for SDRL gravity super-resolution.
 Based on: Remote Sens. 2026, 18, 453  (Equations 3 and 5)
 
-Fixes vs v2:
-  - cycle_loss and dual_reg_loss now compare against x[:, :1] (the
-    gravity channel only) instead of the full x. This matters when x
-    has more than 1 channel (e.g. gravity + GEBCO + NZ Bathymetry +
-    EGM2008): DualNet (model.py) always outputs exactly 1 channel — it
-    was never meant to reconstruct the auxiliary channels — so
-    comparing its output against the full multi-channel x raised a
-    shape mismatch (and would have been conceptually wrong even if the
-    shapes had happened to match). dual_cons_loss is unaffected since
-    both sides were already 1-channel.
-  - When x has exactly 1 channel, x[:, :1] is a no-op slice, so this
-    change is fully backward compatible with the single-channel
-    pipeline.
+Fixes vs v3:
+  - compute_metrics(): MRE now excludes near-zero ground-truth pixels
+    (below `mre_floor`) instead of using a tiny epsilon in the
+    denominator. |pred-gt|/|gt| blows up near zero-crossings (common in
+    gravity fields, which oscillate around 0), and a tiny absolute error
+    there produced an arbitrarily large "relative error" that dominated
+    the mean and made the metric meaningless (observed: mean MRE ~158,
+    with per-patch values into the tens of thousands). Both mean and
+    median are now reported; median is far more robust to any remaining
+    outliers. Returns NaN (not a huge number) for patches that are
+    entirely near-zero ground truth, since MRE is genuinely undefined
+    there — downstream code that averages `mre` across many patches
+    must use np.nanmean, not np.mean, or a single NaN patch will poison
+    the average.
+
+Fixes vs v2->v3 (multi-channel input support):
+  - cycle_loss and dual_reg_loss compare against x[:, :1] (the gravity
+    channel only) instead of the full x, since DualNet always outputs
+    exactly 1 channel. No-op slice when x already has 1 channel.
 
 Fixes carried over from v1->v2:
   - alpha is FIXED at 0.84 (not learnable) — eliminates collapse to 0
@@ -96,19 +102,10 @@ class SDRLLoss(nn.Module):
              + grad_w*gradient_loss(P(x), y)             ← anti-blur
            ]
 
-    where x_grav = x[:, :1] — DualNet always outputs a single channel
-    (it maps HR gravity -> LR gravity), so every loss term that compares
-    against a DualNet output must compare against the gravity channel of
-    x specifically, not the full multi-channel LR tensor. This is a
-    no-op when x already has exactly 1 channel.
-
-    Key changes vs v1:
-      - alpha fixed at 0.84 (no collapse)
-      - recon weighted 3x
-      - gradient loss added to fight blank/blurry outputs
-    Key change vs v2:
-      - cycle/dual_reg losses correctly sliced to the gravity channel
-        for multi-channel inputs
+    where x_grav = x[:, :1] — DualNet always outputs a single channel, so
+    every loss term compared against a DualNet output must use the
+    gravity channel of x specifically, not the full multi-channel tensor.
+    No-op when x already has exactly 1 channel.
     """
     def __init__(self,
                  lam:    float = 0.5,
@@ -129,18 +126,13 @@ class SDRLLoss(nn.Module):
                 x: torch.Tensor,
                 y: torch.Tensor | None = None) -> dict:
 
-        # DualNet's target/reference channel — always channel 0 (gravity),
-        # regardless of how many channels x has. No-op slice if x is
-        # already single-channel.
-        x_grav = x[:, :1]
+        x_grav = x[:, :1]  # DualNet's target/reference channel — always gravity
 
         y_hat = P_model(x)           # predicted HR  (B,1,200,200)
         x_hat = D_model(y_hat)       # cycle LR      (B,1,50,50)
 
-        # clamp outputs to valid range to avoid SSIM errors
         y_hat_c = y_hat.clamp(0, 1)
 
-        # cycle loss — always computed (unsupervised)
         cycle_loss = self.L(x_hat, x_grav)
 
         recon_loss = dual_reg_loss = dual_cons_loss = grad_loss = \
@@ -176,7 +168,18 @@ class SDRLLoss(nn.Module):
 @torch.no_grad()
 def compute_metrics(pred: torch.Tensor,
                     gt:   torch.Tensor,
-                    data_range: float = 1.0) -> dict:
+                    data_range: float = 1.0,
+                    mre_floor: float = 0.05) -> dict:
+    """
+    mre_floor: minimum |gt| (normalized [0,1] units) below which a pixel is
+    excluded from the MRE calculation. MRE = |pred-gt|/|gt| is only
+    meaningful when gt isn't close to zero; near zero-crossings (common
+    in gravity fields), the denominator vanishes and a tiny absolute
+    error produces an arbitrarily large "relative error" that swamps the
+    mean. Both mean and median MRE are reported; median is far more
+    robust to any remaining outliers. Returns NaN when a patch has no
+    valid (above-floor) pixels at all.
+    """
     assert pred.shape == gt.shape, (
         f"compute_metrics received mismatched shapes: {tuple(pred.shape)} "
         f"vs {tuple(gt.shape)}."
@@ -185,8 +188,17 @@ def compute_metrics(pred: torch.Tensor,
     gt_c   = gt.clamp(0, 1)
     mse    = torch.mean((pred_c - gt_c) ** 2).item()
     mae    = torch.mean(torch.abs(pred_c - gt_c)).item()
-    mre    = torch.mean(
-        torch.abs(pred_c - gt_c) / (torch.abs(gt_c) + 1e-6)).item()
+
+    abs_err = torch.abs(pred_c - gt_c)
+    valid_mask = torch.abs(gt_c) > mre_floor
+    if valid_mask.sum() > 0:
+        rel_err = abs_err[valid_mask] / torch.abs(gt_c[valid_mask])
+        mre = torch.mean(rel_err).item()
+        mre_median = torch.median(rel_err).item()
+    else:
+        mre = float('nan')
+        mre_median = float('nan')
+
     psnr   = 10 * torch.log10(
         torch.tensor(data_range**2 / (mse + 1e-10))).item()
     sig_power = torch.mean(gt_c**2).item()
@@ -195,4 +207,4 @@ def compute_metrics(pred: torch.Tensor,
     ssim_v = pt_ssim(pred_c, gt_c,
                      data_range=data_range, size_average=True).item()
     return dict(psnr=psnr, snr=snr, ssim=ssim_v,
-                mse=mse, mae=mae, mre=mre)
+                mse=mse, mae=mae, mre=mre, mre_median=mre_median)
