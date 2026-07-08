@@ -1,18 +1,33 @@
 """
-model.py  (v3 — multi-channel input support)
+model.py  (v4 — shortcut slices gravity channel instead of averaging)
 -------------------------------------------------------
 SDRL network architecture for gravity super-resolution.
 Based on: Remote Sens. 2026, 18, 453  (Section 3.4)
 
-Fixes vs v2:
-  - PrimaryNet now accepts `in_channels` (default 1, backward compatible)
+Fixes vs v3:
+  - shortcut_proj now SLICES channel 0 (gravity) instead of averaging all
+    input channels together. The shortcut path exists specifically to
+    give the decoder a strong, learnable-but-simple prior: "gravity,
+    bilinearly upsampled." Averaging gravity together with GEBCO
+    bathymetry, NZ bathymetry, and EGM2008 — three fields with
+    completely different physical meaning and spatial statistics —
+    diluted that prior and likely made the residual path meaningfully
+    less useful than in the original 1-channel model, forcing the
+    decoder to compensate for a weaker starting point. Slicing
+    reproduces exactly the single-channel model's shortcut behavior
+    regardless of how many auxiliary channels are present. This is a
+    pure indexing operation (not a learned layer), so there's no new
+    randomly-initialized weight on this path at all — one less thing
+    to train from scratch.
+  - shortcut_proj is now a lightweight callable (a channel-slicing
+    module) rather than a Conv2d, for in_channels > 1. Still
+    nn.Identity() when in_channels == 1, so single-channel behavior is
+    completely unchanged.
+
+Fixes vs v2->v3 (multi-channel input support, superseded above):
+  - PrimaryNet accepted `in_channels` (default 1, backward compatible)
   - stem's first conv uses in_channels instead of hardcoded 1
-  - shortcut path now projects in_channels -> 1 (via 1x1 conv) BEFORE
-    bilinear upsampling, since the shortcut is a residual skip of the
-    gravity signal specifically, not the auxiliary channels (GEBCO,
-    NZ Bathymetry, EGM2008). When in_channels == 1 this projection is
-    an nn.Identity(), so single-channel behavior is unchanged.
-  - build_models() now accepts and forwards in_channels
+  - build_models() accepts and forwards in_channels
   - DualNet is UNCHANGED and stays fixed at 1 input/output channel by
     design: it maps HR gravity -> LR gravity for the cycle-consistency
     term and was never meant to touch the auxiliary channels.
@@ -174,6 +189,21 @@ class DecoderBlock(nn.Module):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Channel-slicing shortcut projection
+# ════════════════════════════════════════════════════════════════════════════
+class GravityChannelSlice(nn.Module):
+    """
+    Extracts channel 0 (gravity) from a multi-channel input. Used in place
+    of a learned projection for the shortcut/residual path, so that path
+    reproduces exactly what the original single-channel model's shortcut
+    did (a bilinear upsample of the raw gravity field), regardless of how
+    many auxiliary channels are present in the full input.
+    """
+    def forward(self, x):
+        return x[:, :1]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Primary Network  P : LR → HR   (×4 super-resolution)
 # ════════════════════════════════════════════════════════════════════════════
 class PrimaryNet(nn.Module):
@@ -181,15 +211,14 @@ class PrimaryNet(nn.Module):
     Input : (B, in_channels, 50,  50)
     Output: (B, 1, 200, 200)
 
-    `in_channels` defaults to 1 for full backward compatibility with the
-    original single-channel (gravity-only) pipeline. When in_channels > 1
-    (e.g. gravity + GEBCO + NZ Bathymetry + EGM2008), the auxiliary
-    channels are used by the encoder/bottleneck/decoder as before, but
-    the shortcut residual path is projected down to 1 channel first
-    (via `shortcut_proj`), since the shortcut is meant to be a residual
-    skip of the gravity signal specifically — the model must still learn
-    to combine the auxiliary channels through the full network, they are
-    not added directly into the output via the shortcut.
+    `in_channels` defaults to 1 for full backward compatibility. When
+    in_channels > 1, the auxiliary channels are used by the encoder /
+    bottleneck / decoder as before (so the model can still learn to
+    combine them), but the shortcut residual path now uses ONLY the
+    gravity channel (channel 0) — see GravityChannelSlice — reproducing
+    the original single-channel model's strong "bilinear-upsampled
+    gravity" prior rather than diluting it by averaging across
+    physically unrelated auxiliary channels.
 
     Key fix (v2): shortcut is scaled by learnable weight init=0.1
     so the decoder MUST learn meaningful residuals rather than
@@ -231,20 +260,13 @@ class PrimaryNet(nn.Module):
             nn.PixelShuffle(4),
         )
 
-        # Shortcut: project multi-channel input down to 1 channel (the
-        # gravity signal) BEFORE bilinear upsampling. When in_channels==1
-        # this is a no-op (nn.Identity()), so single-channel behavior is
-        # unchanged from v2.
+        # Shortcut: extract gravity channel (channel 0) BEFORE bilinear
+        # upsampling. Identity when in_channels==1 (no-op slice — a
+        # single-channel input's "channel 0" is the whole input), so
+        # single-channel behavior is completely unchanged from v2/v3.
         self.shortcut_proj = (
-            nn.Conv2d(in_channels, 1, kernel_size=1, bias=False)
-            if in_channels != 1 else nn.Identity()
+            GravityChannelSlice() if in_channels != 1 else nn.Identity()
         )
-        if in_channels != 1:
-            # initialize as a simple average of input channels, so the
-            # starting behavior approximates "use the gravity channel"
-            # rather than random noise on the residual path
-            with torch.no_grad():
-                self.shortcut_proj.weight.fill_(1.0 / in_channels)
 
         self.shortcut       = nn.Upsample(scale_factor=4, mode='bilinear',
                                           align_corners=False)
@@ -275,13 +297,11 @@ class DualNet(nn.Module):
     Input : (B, 1, 200, 200)
     Output: (B, 1, 50,  50)
 
-    UNCHANGED from v2, and deliberately stays fixed at 1 in/out channel.
-    This network's role is the cycle-consistency term: map HR gravity
-    back down to LR gravity. It is not meant to reconstruct the
-    auxiliary channels (GEBCO, NZ Bathymetry, EGM2008) — the loss
-    function must compare its output only against the gravity channel
-    of the LR input (x[:, :1]), not the full multi-channel tensor.
-    See loss.py for the corresponding fix.
+    UNCHANGED, and deliberately stays fixed at 1 in/out channel. This
+    network's role is the cycle-consistency term: map HR gravity back
+    down to LR gravity. It is not meant to reconstruct the auxiliary
+    channels — the loss function compares its output only against the
+    gravity channel of the LR input (x[:, :1]). See loss.py.
     """
     def __init__(self, base_ch: int = 32):
         super().__init__()
@@ -320,8 +340,7 @@ def build_models(base_ch: int = 32, in_channels: int = 1, device: str = 'cuda'):
     """
     in_channels: number of input channels for PrimaryNet (e.g. 4 for
     gravity + GEBCO + NZ Bathymetry + EGM2008). Defaults to 1 for full
-    backward compatibility. DualNet is always 1-channel by design — see
-    DualNet docstring — so it does not take an in_channels argument.
+    backward compatibility. DualNet is always 1-channel by design.
     """
     P = PrimaryNet(base_ch, in_channels=in_channels).to(device)
     D = DualNet(base_ch).to(device)
@@ -344,13 +363,21 @@ if __name__ == '__main__':
     print(f"[in_channels=1] P(lr)    → {y_hat.shape}  expected (2,1,200,200)")
     print(f"[in_channels=1] D(P(lr)) → {x_hat.shape}  expected (2,1,50,50)")
     print(f"shortcut_scale = {P.shortcut_scale.item():.3f}")
+    assert isinstance(P.shortcut_proj, torch.nn.Identity), \
+        "in_channels=1 should use Identity for shortcut_proj"
 
-    # multi-channel check
+    # multi-channel check — verify shortcut actually uses channel 0 only
     P4, D4 = build_models(base_ch=32, in_channels=4, device=device)
     lr4 = torch.randn(2, 4, 50, 50, device=device)
     y_hat4 = P4(lr4)
     x_hat4 = D4(y_hat4)
     print(f"[in_channels=4] P(lr)    → {y_hat4.shape}  expected (2,1,200,200)")
     print(f"[in_channels=4] D(P(lr)) → {x_hat4.shape}  expected (2,1,50,50)")
+    assert isinstance(P4.shortcut_proj, GravityChannelSlice), \
+        "in_channels=4 should use GravityChannelSlice for shortcut_proj"
+    sliced = P4.shortcut_proj(lr4)
+    assert sliced.shape[1] == 1 and torch.equal(sliced, lr4[:, :1]), \
+        "shortcut_proj should extract exactly channel 0"
+    print("shortcut_proj correctly slices channel 0 (verified)")
 
     print("✓ Model check passed")
