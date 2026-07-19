@@ -1,43 +1,32 @@
 """
-model.py  (v4 — shortcut slices gravity channel instead of averaging)
+model.py  (v5 — ablation-ready)
 -------------------------------------------------------
-SDRL network architecture for gravity super-resolution.
-Based on: Remote Sens. 2026, 18, 453  (Section 3.4)
+SDRL / NZGravNet network architecture for gravity super-resolution.
+Based on: Remote Sens. 2026, 18, 453 (Jia et al.), adapted for NZ EEZ.
 
-Fixes vs v3:
-  - shortcut_proj now SLICES channel 0 (gravity) instead of averaging all
-    input channels together. The shortcut path exists specifically to
-    give the decoder a strong, learnable-but-simple prior: "gravity,
-    bilinearly upsampled." Averaging gravity together with GEBCO
-    bathymetry, NZ bathymetry, and EGM2008 — three fields with
-    completely different physical meaning and spatial statistics —
-    diluted that prior and likely made the residual path meaningfully
-    less useful than in the original 1-channel model, forcing the
-    decoder to compensate for a weaker starting point. Slicing
-    reproduces exactly the single-channel model's shortcut behavior
-    regardless of how many auxiliary channels are present. This is a
-    pure indexing operation (not a learned layer), so there's no new
-    randomly-initialized weight on this path at all — one less thing
-    to train from scratch.
-  - shortcut_proj is now a lightweight callable (a channel-slicing
-    module) rather than a Conv2d, for in_channels > 1. Still
-    nn.Identity() when in_channels == 1, so single-channel behavior is
-    completely unchanged.
+New in this version (ablation support):
+  - PrimaryNet(disable_shortcut=True) implements Test B1: removes the
+    residual shortcut path entirely (returns hr directly), to test
+    whether the decoder is generating genuine new high-frequency content
+    or the model's apparent quality is coming mostly from the bilinear-
+    upsampled gravity prior added at the end.
+  - PrimaryNet(rcab_depth_scale=0.5) implements Test C2: halves the
+    number of RCAB blocks in the bottleneck and each decoder stage
+    (rounded up, minimum 1), to test whether the current depth is
+    actually earning its computational cost.
+  - base_ch already existed and directly implements Test C1 (width
+    ablation) — no change needed, just pass a smaller base_ch (e.g. 16
+    or 24 instead of 48) when building the model.
+  - Channel ablations (A1/A2/A3) do NOT require changes here — they are
+    implemented by zeroing input channels before the batch reaches the
+    model (see the training cell), since in_channels stays fixed at 4
+    for a fair architecture comparison.
 
-Fixes vs v2->v3 (multi-channel input support, superseded above):
-  - PrimaryNet accepted `in_channels` (default 1, backward compatible)
-  - stem's first conv uses in_channels instead of hardcoded 1
-  - build_models() accepts and forwards in_channels
-  - DualNet is UNCHANGED and stays fixed at 1 input/output channel by
-    design: it maps HR gravity -> LR gravity for the cycle-consistency
-    term and was never meant to touch the auxiliary channels.
-
-Fixes carried over from v1->v2:
-  - Shortcut scaled by learnable 0.1 weight so decoder is forced to
-    actually learn rather than collapsing to pure bilinear upsampling
-  - BatchNorm added to stem to normalise input distribution
-  - Decoder n_rcab increased from 4→6 for stronger feature learning
-  - PixelShuffle init with ICNR to reduce checkerboard artefacts
+All fixes from v4 are preserved unchanged:
+  - in_channels support in PrimaryNet / build_models
+  - shortcut path restricted to the gravity channel only (not an
+    average across all 4 channels), via GravityChannelSlice
+  - DualNet unchanged, fixed at 1 channel by design
 """
 
 import torch
@@ -50,7 +39,6 @@ import math
 # ICNR initialisation for PixelShuffle (reduces checkerboard)
 # ════════════════════════════════════════════════════════════════════════════
 def icnr_init(tensor: torch.Tensor, scale: int = 4):
-    """ICNR init: each sub-pixel gets the same initialisation."""
     out_ch, in_ch, kH, kW = tensor.shape
     sub = out_ch // (scale * scale)
     kernel = torch.zeros(sub, in_ch, kH, kW)
@@ -67,7 +55,6 @@ class LiteMLA(nn.Module):
     def __init__(self, channels: int, heads: int = 4,
                  kernel_sizes=(3, 5, 7)):
         super().__init__()
-        # ensure heads divides channels
         while channels % heads != 0 and heads > 1:
             heads //= 2
         self.heads = heads
@@ -176,6 +163,7 @@ class DecoderBlock(nn.Module):
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int,
                  n_rcab: int = 6):
         super().__init__()
+        n_rcab = max(1, n_rcab)  # never allow zero blocks
         self.fuse = nn.Conv2d(in_ch + skip_ch, in_ch, 1, bias=False)
         self.rcab = nn.Sequential(*[RCAB(in_ch) for _ in range(n_rcab)])
         self.up   = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
@@ -192,13 +180,10 @@ class DecoderBlock(nn.Module):
 # Channel-slicing shortcut projection
 # ════════════════════════════════════════════════════════════════════════════
 class GravityChannelSlice(nn.Module):
-    """
-    Extracts channel 0 (gravity) from a multi-channel input. Used in place
-    of a learned projection for the shortcut/residual path, so that path
-    reproduces exactly what the original single-channel model's shortcut
-    did (a bilinear upsample of the raw gravity field), regardless of how
-    many auxiliary channels are present in the full input.
-    """
+    """Extracts channel 0 (gravity) from a multi-channel input, so the
+    shortcut/residual path reproduces the single-channel model's
+    behaviour (bilinear-upsampled gravity) regardless of auxiliary
+    channel count."""
     def forward(self, x):
         return x[:, :1]
 
@@ -211,23 +196,30 @@ class PrimaryNet(nn.Module):
     Input : (B, in_channels, 50,  50)
     Output: (B, 1, 200, 200)
 
-    `in_channels` defaults to 1 for full backward compatibility. When
-    in_channels > 1, the auxiliary channels are used by the encoder /
-    bottleneck / decoder as before (so the model can still learn to
-    combine them), but the shortcut residual path now uses ONLY the
-    gravity channel (channel 0) — see GravityChannelSlice — reproducing
-    the original single-channel model's strong "bilinear-upsampled
-    gravity" prior rather than diluting it by averaging across
-    physically unrelated auxiliary channels.
+    disable_shortcut (Test B1): if True, the residual shortcut path is
+    removed entirely and forward() returns the decoder's output (hr)
+    directly, with no added bilinear-upsampled gravity term. Used to
+    test whether the network's internal layers are generating genuine
+    new high-frequency content, or whether apparent quality is coming
+    mostly from the shortcut's low-frequency prior.
 
-    Key fix (v2): shortcut is scaled by learnable weight init=0.1
-    so the decoder MUST learn meaningful residuals rather than
-    collapsing to pure bilinear upsampling (blank output bug).
+    rcab_depth_scale (Test C2): scales the number of RCAB blocks in the
+    bottleneck and each decoder stage relative to the default depth
+    (bottleneck 3, dec3 6, dec2 6, dec1 4), rounded up with a minimum of
+    1 block per stage. rcab_depth_scale=0.5 approximately halves depth.
+    rcab_depth_scale=1.0 (default) reproduces the original architecture
+    exactly.
     """
-    def __init__(self, base_ch: int = 32, in_channels: int = 1):
+    def __init__(self, base_ch: int = 32, in_channels: int = 1,
+                 disable_shortcut: bool = False,
+                 rcab_depth_scale: float = 1.0):
         super().__init__()
         c = base_ch
         self.in_channels = in_channels
+        self.disable_shortcut = disable_shortcut
+
+        def scaled(n):
+            return max(1, math.ceil(n * rcab_depth_scale))
 
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, c, 3, padding=1, bias=False),
@@ -241,17 +233,13 @@ class PrimaryNet(nn.Module):
 
         self.bottleneck = nn.Sequential(
             LiteMLA(c * 8),
-            RCAB(c * 8),
-            RCAB(c * 8),
-            RCAB(c * 8),
+            *[RCAB(c * 8) for _ in range(scaled(3))],
         )
 
-        # dec(in_ch, skip_ch, out_ch)
-        self.dec3 = DecoderBlock(c * 8, c * 8, c * 4, n_rcab=6)
-        self.dec2 = DecoderBlock(c * 4, c * 4, c * 2, n_rcab=6)
-        self.dec1 = DecoderBlock(c * 2, c * 2, c,     n_rcab=4)
+        self.dec3 = DecoderBlock(c * 8, c * 8, c * 4, n_rcab=scaled(6))
+        self.dec2 = DecoderBlock(c * 4, c * 4, c * 2, n_rcab=scaled(6))
+        self.dec1 = DecoderBlock(c * 2, c * 2, c,     n_rcab=scaled(4))
 
-        # ×4 upsample with ICNR init — always produces 1 output channel
         ps_conv = nn.Conv2d(c, 1 * 16, 3, padding=1, bias=False)
         icnr_init(ps_conv.weight, scale=4)
         self.final_up = nn.Sequential(
@@ -260,19 +248,13 @@ class PrimaryNet(nn.Module):
             nn.PixelShuffle(4),
         )
 
-        # Shortcut: extract gravity channel (channel 0) BEFORE bilinear
-        # upsampling. Identity when in_channels==1 (no-op slice — a
-        # single-channel input's "channel 0" is the whole input), so
-        # single-channel behavior is completely unchanged from v2/v3.
-        self.shortcut_proj = (
-            GravityChannelSlice() if in_channels != 1 else nn.Identity()
-        )
-
-        self.shortcut       = nn.Upsample(scale_factor=4, mode='bilinear',
-                                          align_corners=False)
-        # Shortcut scaled by small learnable weight (init=0.1)
-        # This FORCES the decoder to contribute rather than being ignored
-        self.shortcut_scale = nn.Parameter(torch.tensor(0.1))
+        if not disable_shortcut:
+            self.shortcut_proj = (
+                GravityChannelSlice() if in_channels != 1 else nn.Identity()
+            )
+            self.shortcut = nn.Upsample(scale_factor=4, mode='bilinear',
+                                        align_corners=False)
+            self.shortcut_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x):
         s  = self.stem(x)
@@ -284,7 +266,13 @@ class PrimaryNet(nn.Module):
         u2 = self.dec2(u3, sk2)
         u1 = self.dec1(u2, sk1)
         hr = self.final_up(u1)
-        # scaled shortcut — model must learn to produce non-trivial residuals
+
+        if self.disable_shortcut:
+            # Test B1: no residual shortcut — output is whatever the
+            # decoder produces on its own, with no added low-frequency
+            # gravity prior.
+            return hr
+
         shortcut_1ch = self.shortcut_proj(x)
         return hr + self.shortcut_scale * self.shortcut(shortcut_1ch)
 
@@ -297,11 +285,9 @@ class DualNet(nn.Module):
     Input : (B, 1, 200, 200)
     Output: (B, 1, 50,  50)
 
-    UNCHANGED, and deliberately stays fixed at 1 in/out channel. This
-    network's role is the cycle-consistency term: map HR gravity back
-    down to LR gravity. It is not meant to reconstruct the auxiliary
-    channels — the loss function compares its output only against the
-    gravity channel of the LR input (x[:, :1]). See loss.py.
+    Unchanged across all ablations — always 1-channel, always the same
+    depth. Test B2 (no dual-regression loss) is implemented by setting
+    mu=0 in SDRLLoss, not by modifying this network.
     """
     def __init__(self, base_ch: int = 32):
         super().__init__()
@@ -336,48 +322,21 @@ class DualNet(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 # Builder
 # ════════════════════════════════════════════════════════════════════════════
-def build_models(base_ch: int = 32, in_channels: int = 1, device: str = 'cuda'):
+def build_models(base_ch: int = 32, in_channels: int = 1, device: str = 'cuda',
+                  disable_shortcut: bool = False, rcab_depth_scale: float = 1.0):
     """
-    in_channels: number of input channels for PrimaryNet (e.g. 4 for
-    gravity + GEBCO + NZ Bathymetry + EGM2008). Defaults to 1 for full
-    backward compatibility. DualNet is always 1-channel by design.
+    base_ch          : Test C1 (width) — pass e.g. 16 or 24 for a
+                        lightweight variant instead of the default 48.
+    disable_shortcut : Test B1 — True removes the residual shortcut path.
+    rcab_depth_scale : Test C2 — 0.5 approximately halves RCAB depth.
     """
-    P = PrimaryNet(base_ch, in_channels=in_channels).to(device)
+    P = PrimaryNet(base_ch, in_channels=in_channels,
+                   disable_shortcut=disable_shortcut,
+                   rcab_depth_scale=rcab_depth_scale).to(device)
     D = DualNet(base_ch).to(device)
     n_P = sum(p.numel() for p in P.parameters() if p.requires_grad)
     n_D = sum(p.numel() for p in D.parameters() if p.requires_grad)
-    print(f"PrimaryNet : {n_P:,} params  (base_ch={base_ch}, in_channels={in_channels})")
+    print(f"PrimaryNet : {n_P:,} params  (base_ch={base_ch}, in_channels={in_channels}, "
+          f"disable_shortcut={disable_shortcut}, rcab_depth_scale={rcab_depth_scale})")
     print(f"DualNet    : {n_D:,} params  (in_channels=1, fixed)")
     return P, D
-
-
-if __name__ == '__main__':
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # single-channel backward-compatibility check
-    P, D = build_models(base_ch=32, in_channels=1, device=device)
-    lr = torch.randn(2, 1, 50,  50, device=device)
-    hr = torch.randn(2, 1, 200, 200, device=device)
-    y_hat = P(lr)
-    x_hat = D(y_hat)
-    print(f"[in_channels=1] P(lr)    → {y_hat.shape}  expected (2,1,200,200)")
-    print(f"[in_channels=1] D(P(lr)) → {x_hat.shape}  expected (2,1,50,50)")
-    print(f"shortcut_scale = {P.shortcut_scale.item():.3f}")
-    assert isinstance(P.shortcut_proj, torch.nn.Identity), \
-        "in_channels=1 should use Identity for shortcut_proj"
-
-    # multi-channel check — verify shortcut actually uses channel 0 only
-    P4, D4 = build_models(base_ch=32, in_channels=4, device=device)
-    lr4 = torch.randn(2, 4, 50, 50, device=device)
-    y_hat4 = P4(lr4)
-    x_hat4 = D4(y_hat4)
-    print(f"[in_channels=4] P(lr)    → {y_hat4.shape}  expected (2,1,200,200)")
-    print(f"[in_channels=4] D(P(lr)) → {x_hat4.shape}  expected (2,1,50,50)")
-    assert isinstance(P4.shortcut_proj, GravityChannelSlice), \
-        "in_channels=4 should use GravityChannelSlice for shortcut_proj"
-    sliced = P4.shortcut_proj(lr4)
-    assert sliced.shape[1] == 1 and torch.equal(sliced, lr4[:, :1]), \
-        "shortcut_proj should extract exactly channel 0"
-    print("shortcut_proj correctly slices channel 0 (verified)")
-
-    print("✓ Model check passed")
